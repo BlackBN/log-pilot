@@ -105,7 +105,7 @@ output.kafka:
 {{- if eq .type "logstash" }}
 output.logstash:
     hosts:
-    {{- range .hosts }}
+    {{- range .logstashHost }}
     - {{ . }}
     {{- end }}
     {{- if .loadbalance }}
