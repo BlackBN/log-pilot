@@ -1,15 +1,18 @@
 package main
 
 import (
+	"crypto/sha256"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
-	"syscall"
 	"text/template"
+	"time"
 
 	"gopkg.in/yaml.v2"
 
@@ -17,51 +20,97 @@ import (
 	"github.com/caicloud/logging-admin/pkg/util/osutil"
 
 	"github.com/caicloud/nirvana/log"
-	"gopkg.in/fsnotify/fsnotify.v1"
+)
+
+const (
+	HeatlthCheckInterval = "HEATLTH_CHECK_INTERVAL"
+	ConfigCheckInterval  = "CONFIG_CHECK_INTERVAL"
 )
 
 var (
 	filebeatExecutablePath = osutil.Getenv("FB_EXE_PATH", "filebeat")
 	srcConfigPath          = osutil.Getenv("SRC_CONFIG_PATH", "/config/filebeat-output.yml")
 	dstConfigPath          = osutil.Getenv("DST_CONFIG_PATH", "/etc/filebeat/filebeat.yml")
+	heatlthCheckInterval   = int64(10)
+	configCheckInterval    = int64(600)
 )
 
-// When configmap being created for the first time, following events received:
-// INFO  1206-09:38:39.496+00 main.go:41 | Event: "/config/..2018_12_06_09_38_39.944532540": CREATE
-// INFO  1206-09:38:39.496+00 main.go:41 | Event: "/config/..2018_12_06_09_38_39.944532540": CHMOD
-// INFO  1206-09:38:39.497+00 main.go:41 | Event: "/config/filebeat-output.yml": CREATE
-// INFO  1206-09:38:39.497+00 main.go:41 | Event: "/config/..data_tmp": RENAME
-// INFO  1206-09:38:39.497+00 main.go:41 | Event: "/config/..data": CREATE
-// INFO  1206-09:38:39.497+00 main.go:41 | Event: "/config/..2018_12_06_09_37_32.878326343": REMOVE
-// When configmap being modified, following events received:
-// INFO  1206-09:42:56.488+00 main.go:41 | Event: "/config/..2018_12_06_09_42_56.160544363": CREATE
-// INFO  1206-09:42:56.488+00 main.go:41 | Event: "/config/..2018_12_06_09_42_56.160544363": CHMOD
-// INFO  1206-09:42:56.488+00 main.go:41 | Event: "/config/..data_tmp": RENAME
-// INFO  1206-09:42:56.488+00 main.go:41 | Event: "/config/..data": CREATE
-// INFO  1206-09:42:56.488+00 main.go:41 | Event: "/config/..2018_12_06_09_38_39.944532540": REMOVE
-func watchFileChange(path string, reloadCh chan<- struct{}) error {
-	w, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-	if err := w.Add(path); err != nil {
-		return err
+func init() {
+	sec, err := strconv.ParseInt(osutil.Getenv(HeatlthCheckInterval,
+		strconv.FormatInt(heatlthCheckInterval, 10)), 10, 64)
+	if err != nil || sec < 0 {
+		log.Warningf("%s is Invalid, use default value %d", HeatlthCheckInterval, heatlthCheckInterval)
+	} else {
+		heatlthCheckInterval = sec
 	}
 
-	for {
-		select {
-		case ev := <-w.Events:
-			log.Infoln("Event:", ev.String())
-			if ev.Op&fsnotify.Create == fsnotify.Create {
-				if filepath.Base(ev.Name) == "..data" {
-					log.Infoln("Configmap updated")
-					reloadCh <- struct{}{}
-				}
-			}
-		case err := <-w.Errors:
-			log.Errorf("Watch error: %v", err)
+	sec, err = strconv.ParseInt(osutil.Getenv(ConfigCheckInterval,
+		strconv.FormatInt(configCheckInterval, 10)), 10, 64)
+	if err != nil || sec < 0 {
+		log.Warningf("%s is Invalid, use default value %d", ConfigCheckInterval, configCheckInterval)
+	} else {
+		configCheckInterval = sec
+	}
+}
+
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	return string(h.Sum(nil)), nil
+}
+
+func newFileChecker(path string, notify func()) func() {
+	var (
+		curHash string
+		mtx     sync.Mutex
+		err     error
+	)
+
+	curHash, err = hashFile(path)
+	if err != nil {
+		log.Warningln(err)
+	}
+
+	return func() {
+		mtx.Lock()
+		defer mtx.Unlock()
+
+		h, err := hashFile(path)
+		if err != nil {
+			log.Warningln(err)
+			return
+		}
+
+		if curHash != h {
+			log.Infof("file need reload, old: %x, new: %x", curHash, h)
+			curHash = h
+			notify()
 		}
 	}
+}
+
+func watchFileChange(path string, reloadCh chan<- struct{}) {
+	checker := newFileChecker(path, func() { reloadCh <- struct{}{} })
+
+	//watch CM
+	go watchConfigMapUpdate(filepath.Dir(path), checker)
+
+	//定时监测
+	go func(checkFile func()) {
+		check := time.Tick(time.Duration(configCheckInterval) * time.Second)
+		for range check {
+			checkFile()
+		}
+	}(checker)
 }
 
 func run(stopCh <-chan struct{}) error {
@@ -69,7 +118,7 @@ func run(stopCh <-chan struct{}) error {
 	started := false
 	cmd := newCmd()
 
-	go watchFileChange(filepath.Dir(srcConfigPath), reloadCh)
+	watchFileChange(srcConfigPath, reloadCh)
 
 	if err := applyChange(); err == nil {
 		reloadCh <- struct{}{}
@@ -78,11 +127,12 @@ func run(stopCh <-chan struct{}) error {
 		log.Infoln("Filebeat will not start until configmap being updated")
 	}
 
+	check := time.Tick(time.Duration(heatlthCheckInterval) * time.Second)
 	for {
 		select {
 		case <-stopCh:
 			log.Infoln("Wait filebeat shutdown")
-			if err := cmd.Wait(); err != nil {
+			if err := cmd.Stop(); err != nil {
 				return fmt.Errorf("filebeat quit with error: %v", err)
 			}
 			return nil
@@ -100,11 +150,7 @@ func run(stopCh <-chan struct{}) error {
 				log.Infoln("Filebeat start")
 				started = true
 			} else {
-				log.Infoln("Send TERM signal")
-				if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-					return fmt.Errorf("error send signal: %v", err)
-				}
-				if err := cmd.Wait(); err != nil {
+				if err := cmd.Stop(); err != nil {
 					return fmt.Errorf("filebeat quit with error: %v", err)
 				}
 				log.Infoln("Filebeat quit")
@@ -112,6 +158,13 @@ func run(stopCh <-chan struct{}) error {
 				cmd = newCmd()
 				if err := cmd.Start(); err != nil {
 					return fmt.Errorf("error run filebeat: %v", err)
+				}
+			}
+		case <-check:
+			if started {
+				if cmd != nil && cmd.Exited() {
+					log.Fatalln("Filebeat has unexpectedly exited")
+					os.Exit(1)
 				}
 			}
 		}
@@ -158,12 +211,13 @@ var (
 	fbArgs []string
 )
 
-func newCmd() *exec.Cmd {
+func newCmd() *AsyncCmd {
 	log.Infof("Will run filebeat with command: %v %v", filebeatExecutablePath, fbArgs)
 	cmd := exec.Command(filebeatExecutablePath, fbArgs...)
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
-	return cmd
+
+	return WrapCmd(cmd)
 }
 
 func main() {
