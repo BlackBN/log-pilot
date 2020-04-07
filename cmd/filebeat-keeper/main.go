@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -23,7 +24,7 @@ import (
 var (
 	filebeatExecutablePath = osutil.Getenv("FB_EXE_PATH", "filebeat")
 	srcConfigPath          = osutil.Getenv("SRC_CONFIG_PATH", "/config/filebeat-output.yml")
-	dstConfigPath          = osutil.Getenv("DST_CONFIG_PATH", "/etc/filebeat/filebeat.yml")
+	dstConfigPath          = osutil.Getenv("DST_CONFIG_PATH", "/etc/filebeat/")
 )
 
 // When configmap being created for the first time, following events received:
@@ -67,11 +68,12 @@ func watchFileChange(path string, reloadCh chan<- struct{}) error {
 func run(stopCh <-chan struct{}) error {
 	reloadCh := make(chan struct{}, 1)
 	started := false
-	cmd := newCmd()
 
 	go watchFileChange(filepath.Dir(srcConfigPath), reloadCh)
 
-	if err := applyChange(); err == nil {
+	var cmds []*exec.Cmd
+	if newCmds, err := applyChange(); err == nil {
+		cmds = newCmds
 		reloadCh <- struct{}{}
 	} else {
 		log.Errorf("Error generate config file: %v", err)
@@ -82,85 +84,92 @@ func run(stopCh <-chan struct{}) error {
 		select {
 		case <-stopCh:
 			log.Infoln("Wait filebeat shutdown")
-			if err := cmd.Wait(); err != nil {
-				return fmt.Errorf("filebeat quit with error: %v", err)
+			for _, cmd := range cmds {
+				if err := cmd.Wait(); err != nil {
+					return fmt.Errorf("filebeat quit with error: %v", err)
+				}
 			}
 			return nil
 		case <-reloadCh:
 			log.Infoln("Reload")
-			if err := applyChange(); err != nil {
+			newCmds, err := applyChange()
+			if err != nil {
 				log.Errorln("Error apply change:", err)
 				continue
 			}
-
-			if !started {
-				if err := cmd.Start(); err != nil {
-					return fmt.Errorf("error run filebeat: %v", err)
+			if started {
+				for _, cmd := range cmds {
+					log.Infoln("Send TERM signal")
+					if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+						return fmt.Errorf("error send signal: %v", err)
+					}
+					if err := cmd.Wait(); err != nil {
+						return fmt.Errorf("filebeat quit with error: %v", err)
+					}
+					log.Infoln("Filebeat quit")
 				}
-				log.Infoln("Filebeat start")
-				started = true
-			} else {
-				log.Infoln("Send TERM signal")
-				if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-					return fmt.Errorf("error send signal: %v", err)
-				}
-				if err := cmd.Wait(); err != nil {
-					return fmt.Errorf("filebeat quit with error: %v", err)
-				}
-				log.Infoln("Filebeat quit")
-
-				cmd = newCmd()
+			}
+			for _, cmd := range newCmds {
 				if err := cmd.Start(); err != nil {
 					return fmt.Errorf("error run filebeat: %v", err)
 				}
 			}
+			started = true
+			cmds = newCmds
 		}
 	}
 }
 
-func applyChange() error {
+func applyChange() ([]*exec.Cmd, error) {
 	outputCfgData, err := ioutil.ReadFile(srcConfigPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	tmplData, err := ioutil.ReadFile("/etc/filebeat/filebeat.yml.tpl")
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	cfg := map[string]interface{}{}
+	cfg := make([]map[string]interface{}, 0)
 	if err := yaml.Unmarshal(outputCfgData, &cfg); err != nil {
-		return fmt.Errorf("error decode output config yaml: %v", err)
+		return nil, fmt.Errorf("error decode output config yaml: %v", err)
 	}
 
 	t, err := template.New("filebeat").Parse(string(tmplData))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	f, err := os.OpenFile(dstConfigPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := t.Execute(f, cfg); err != nil {
-		return fmt.Errorf("error rendor template: %v", err)
-	}
+	var cmds []*exec.Cmd
+	for i, config := range cfg {
+		fName := path.Join(dstConfigPath, fmt.Sprintf("filebeat_%d.yml", i))
+		f, err := os.OpenFile(fName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			return nil, err
+		}
+		if err := t.Execute(f, config); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("error rendor template: %v", err)
+		}
+		f.Close()
 
-	generated, _ := ioutil.ReadFile(dstConfigPath)
-	fmt.Println(string(generated))
-
-	return nil
+		generated, _ := ioutil.ReadFile(fName)
+		fmt.Println(string(generated))
+		// create cmd
+		cmds = append(cmds, newCmd("--c="+fName))
+	}
+	return cmds, nil
 }
 
 var (
 	fbArgs []string
 )
 
-func newCmd() *exec.Cmd {
-	log.Infof("Will run filebeat with command: %v %v", filebeatExecutablePath, fbArgs)
-	cmd := exec.Command(filebeatExecutablePath, fbArgs...)
+func newCmd(configPathArg string) *exec.Cmd {
+	args := append(fbArgs, configPathArg)
+	log.Infof("Will run filebeat with command: %v %v", filebeatExecutablePath, args)
+	cmd := exec.Command(filebeatExecutablePath, args...)
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	return cmd
