@@ -13,6 +13,7 @@
   {{end}}
   fields:
       cluster: ${CLUSTER_ID}
+      "@ip": ${NODE_IP}
       {{- range $key, $value := .Tags }}
       {{ $key }}: "{{ $value }}"
       {{- end }}

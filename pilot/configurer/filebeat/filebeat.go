@@ -95,20 +95,35 @@ type FileInode struct {
 
 // RegistryState is copied from beats/filebeat/registar/registar.go
 type RegistryState struct {
-	Source      string        `json:"source"`
-	Offset      int64         `json:"offset"`
-	Timestamp   time.Time     `json:"timestamp"`
-	TTL         time.Duration `json:"ttl"`
-	Type        string        `json:"type"`
-	FileStateOS FileInode
+	Source        string        `json:"source"`
+	Offset        int64         `json:"offset"`
+	Timestamp     time.Time     `json:"timestamp"`
+	TTL           time.Duration `json:"ttl"`
+	Type          string        `json:"type"`
+	FileStateOS   FileInode
+	RegistryIndex string
 }
 
 func (c *filebeatConfigurer) getInputsDir() string {
 	return filepath.Join(c.filebeatHome, "/inputs.d")
 }
 
-func (c *filebeatConfigurer) getRegistryFile() string {
-	return filepath.Join(c.filebeatHome, "data/registry")
+func (c *filebeatConfigurer) getRegistryFiles() (names []string, err error) {
+	baseDir := filepath.Join(c.filebeatHome, "data")
+	fd, err := os.Open(baseDir)
+	if err != nil {
+		return
+	}
+	fns, err := fd.Readdirnames(-1)
+	if err != nil {
+		return
+	}
+	for _, fn := range fns {
+		if strings.HasPrefix(fn, "registry") {
+			names = append(names, filepath.Join(baseDir, fn))
+		}
+	}
+	return
 }
 
 // BootstrapCheck get called when we bootstrap. It removes unknown files,
@@ -238,7 +253,7 @@ func getLogDirPrefix(base, podID string) string {
 // 先根据用 pod id 生成唯一路径前缀，然后从 registry file 中找到相应的 states
 // 如果是第一次检查，更新 logStates 并返回 false
 // 否则和上一次检查对比，如果 states 有变化说明日志还没采集完, 更新 logStates 并返回 false，若没有变化则返回 true
-func (c *filebeatConfigurer) canRemoveConf(container string, registry map[string]RegistryState, lst *logStates) bool {
+func (c *filebeatConfigurer) canRemoveConf(container string, registry map[string][]RegistryState, lst *logStates) bool {
 	logDirPrefix := getLogDirPrefix(c.base, lst.PodID)
 	c.logger.Debug("LogDir prefix:", logDirPrefix)
 
@@ -247,13 +262,20 @@ func (c *filebeatConfigurer) canRemoveConf(container string, registry map[string
 	for source, rs := range registry {
 		if strings.HasPrefix(source, logDirPrefix) {
 			c.logger.Debug("found match state:", source)
-			states = append(states, rs)
+			states = append(states, rs...)
 		}
 	}
 
 	// Sort states by source
 	bySource := func(i, j int) bool {
-		return states[i].Source < states[j].Source
+		if states[i].Source < states[j].Source {
+			return true
+		}
+		if states[i].Source == states[j].Source &&
+			states[i].RegistryIndex < states[j].RegistryIndex {
+			return true
+		}
+		return false
 	}
 	sort.Slice(states, bySource)
 
@@ -330,24 +352,41 @@ func (c *filebeatConfigurer) render(ev *configurer.ContainerAddEvent) (string, e
 	return buf.String(), nil
 }
 
-func (c *filebeatConfigurer) getRegsitryState() (map[string]RegistryState, error) {
-	f, err := os.Open(c.getRegistryFile())
+func (c *filebeatConfigurer) getRegsitryState() (map[string][]RegistryState, error) {
+	fps, err := c.getRegistryFiles()
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	statesMap := make(map[string][]RegistryState, 0)
 
-	decoder := json.NewDecoder(f)
-	states := make([]RegistryState, 0)
-	err = decoder.Decode(&states)
-	if err != nil {
-		return nil, err
-	}
+	for _, fp := range fps {
+		f, err := os.Open(fp)
+		if err != nil {
+			return nil, err
+		}
+		f.Close()
 
-	statesMap := make(map[string]RegistryState, 0)
-	for _, state := range states {
-		if _, ok := statesMap[state.Source]; !ok {
-			statesMap[state.Source] = state
+		ss := strings.Split(filepath.Base(fp), "_")
+		if len(ss) != 2 {
+			continue
+		}
+
+		decoder := json.NewDecoder(f)
+		states := make([]RegistryState, 0)
+		err = decoder.Decode(&states)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		f.Close()
+
+		for _, state := range states {
+			state.RegistryIndex = ss[1]
+			if _, ok := statesMap[state.Source]; !ok {
+				statesMap[state.Source] = []RegistryState{state}
+			} else {
+				statesMap[state.Source] = append(statesMap[state.Source], state)
+			}
 		}
 	}
 	return statesMap, nil

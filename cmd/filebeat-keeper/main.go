@@ -143,6 +143,7 @@ func applyChange() ([]*exec.Cmd, error) {
 
 	var cmds []*exec.Cmd
 	for i, config := range cfg {
+		config["registryIndex"] = i
 		fName := path.Join(dstConfigPath, fmt.Sprintf("filebeat_%d.yml", i))
 		f, err := os.OpenFile(fName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 		if err != nil {
